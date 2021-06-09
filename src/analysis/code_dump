@@ -1,0 +1,98 @@
+
+'''
+def get_umap_embedding(mat):
+	"""
+	obtains 2D UMAP embedding
+	"""
+	reducer = umap.UMAP(n_components=2)
+	embedding = reducer.fit_transform(mat)
+	return embedding
+	'''
+
+	'''
+def calc_slowFOSCTTM(x1_mat, x2_mat):
+	nsamp = x1_mat.shape[0]
+	fracs = []
+	for i in range(nsamp):
+		x1_closest_dist = float("inf") # initialize to infinity
+		x1_true_nbr = float("inf") # initialize to infinity
+		x2_dists = []
+		for j in range(nsamp):
+			if j != i:
+				x1_dist = spatial.distance.cosine(x1_mat[i,:], x1_mat[j,:])
+				x2_dists.append(spatial.distance.cosine(x2_mat[i,:], x2_mat[j,:]))
+				if x1_dist < x1_closest_dist:
+					x1_closest_dist = x1_dist # set as new closest neighbor
+					x1_true_nbr = j # set index of new closest neighbor
+
+		sorted_x2_dists = np.argsort(np.array(x2_dists)).tolist()
+		rank = sorted_x2_dists.index(x1_true_nbr) 
+		frac = float(rank)/(len(sorted_x2_dists))
+		fracs.append(frac)
+	return fracs
+	'''
+
+	'''
+	M_full = get_umap_embedding(norm_data)
+
+	foscttm = {}
+	nrep = 5
+	for i in range(4,30):
+		print("Calculating average FOSCTMM for number of markers = ", i, "...")
+		fracs = []
+		for j in range(nrep):
+			M_sub = get_umap_embedding(norm_data.T[sorted_genes][:i].T)
+			fracs.append(np.median(calc_domainAveraged_FOSCTTM(M_full, M_sub)))
+		foscttm[i] = min(fracs)
+		print(fracs)
+		print(foscttm[i])
+
+	with open(os.path.join(args.output_dir, 'morans_foscttm_median_reps=3.csv'), 'w') as csv_file:  
+		writer = csv.writer(csv_file)
+		for key, value in foscttm.items():
+			writer.writerow([key, value])
+
+
+	for i in range(2000,2001):
+		print("Calculating average FOSCTMM for number of markers = ", i, "...")
+		M_sub = get_umap_embedding(norm_data.T[sorted_genes][:i].T)
+		print("number of gene indices: ", len(sorted_genes[:i]))
+		fracs = calc_domainAveraged_FOSCTTM(M_full, M_sub)
+		foscttm[i] = np.mean(fracs)
+	print(foscttm)
+	'''
+	'''
+	def calc_frac_idx(x1_mat,x2_mat):
+	"""
+	Returns fraction closer than true match for each sample (as an array)
+	"""
+	fracs = []
+	x = []
+	nsamp = x1_mat.shape[0]
+	rank=0
+	for row_idx in range(nsamp):
+		euc_dist = np.sqrt(np.sum(np.square(np.subtract(x1_mat[row_idx,:], x2_mat)), axis=1))
+		true_nbr = euc_dist[row_idx]
+		sort_euc_dist = sorted(euc_dist)
+		rank =sort_euc_dist.index(true_nbr)
+		frac = float(rank)/(nsamp -1)
+
+		fracs.append(frac)
+		x.append(row_idx+1)
+
+	return fracs,x
+
+def calc_domainAveraged_FOSCTTM(x1_mat, x2_mat):
+	"""
+	Outputs average FOSCTTM measure (averaged over both domains)
+	Get the fraction matched for all data points in both directions
+	Averages the fractions in both directions for each data point
+	"""
+	fracs1,xs = calc_frac_idx(x1_mat, x2_mat)
+	fracs2,xs = calc_frac_idx(x2_mat, x1_mat)
+	fracs = []
+	for i in range(len(fracs1)):
+		fracs.append((fracs1[i]+fracs2[i])/2)  
+	return fracs
+	'''
+

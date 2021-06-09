@@ -1,0 +1,676 @@
+from .utils import *
+import sklearn.metrics
+import os
+
+
+"""LRP-related by Yang"""
+class ClustMinPoolLayer(tf.keras.layers.Layer):
+    def __init__(self, beta):
+        super(ClustMinPoolLayer, self).__init__();
+        self.beta = beta;
+
+    def call(self, inputs, training=False):
+        return - tf.math.log(tf.reduce_sum(tf.math.exp(inputs * tf.constant(-self.beta)), axis=1));
+
+
+class ConcreteSelect(tf.keras.layers.Layer):
+    def __init__(self, num_outputs):
+        super(ConcreteSelect, self).__init__();
+        self.num_outputs = num_outputs;
+
+    def build(self, input_shape):
+        self.logits = self.add_variable('logits', shape=(self.num_outputs, input_shape[-1].value));
+        # logger.info('----------------self.logits={}\t{}'.format(self.logits.shape, self.logits));
+
+    def call(self, inputs, temp, training=None):
+        if training is None:
+            training = K.learning_phase();
+
+        def samples():
+            noisy_logits = self.logits / temp;
+            samples = tf.nn.softmax(noisy_logits);
+            samples_reshaped = tf.reshape(samples, self.logits.shape);
+            return samples_reshaped;
+
+        def discrete_logits():
+            discrete_logits = tf.one_hot(tf.argmax(self.logits, axis=1), self.logits.shape[1]);
+            # logger.info('----------------discrete_logits={}\t{}'.format(discrete_logits.shape, discrete_logits));
+            return discrete_logits;
+
+        selections = tf.cond(training, samples, discrete_logits);
+        outputs = tf.einsum('ij,kj->ik', inputs, selections);
+        # logger.info('----------------outputs={}\t{}'.format(outputs.shape, outputs));
+        return outputs;
+
+
+def nameop(op, name):
+    """
+    Give a name to a tensorflow op.
+
+    :param op: a tensorflow op
+    :param name: a string name for the op
+    """
+    op = tf.identity(op, name=name)
+    return op
+
+
+class SAUCIE(object):
+    """The SAUCIE model."""
+
+    def __init__(self, input_dim, feat_dim,
+        clust_num,
+        beta=1.0,
+        lambda_b=0,
+        lambda_c=0,
+        layer_c=0,
+        lambda_d=0,
+        layers=[512,256,128,2],
+        activation=tf.nn.leaky_relu,
+        learning_rate=.001,
+        restore_folder='',
+        save_folder='',
+        limit_gpu_fraction=.3,
+        no_gpu=False):
+        """
+        The SAUCIE model.
+
+        :param input_dim: the dimensionality of the data
+        :param clust_num: the number of clusters
+        :param feat_dim: the number of selected features
+        :param lambda_b: the coefficient for the MMD regularization
+        :param lambda_c: the coefficient for the ID regularization
+        :param layer_c: the index of layer_dimensions that ID regularization should be applied to (usually len(layer_dimensions)-2)
+        :param lambda_d: the coefficient for the intracluster distance regularization
+        :param activation: the nonlinearity to use in the hidden layers
+        :param loss: the loss function to use, one of 'mse' or 'bce'
+        :param learning_rate: the learning_rate to use while training
+        :param restore_folder: string of the directory where a previous model is saved, if present will return a new Python object
+                               with the old SAUCIE tensorflow graph
+        :param save_folder: string of the directory to save SAUCIE to by default when save() is called
+        """
+        self.input_dim = input_dim
+        self.lambda_b = lambda_b
+        self.lambda_c = lambda_c
+        self.layer_c = layer_c
+        self.lambda_d = lambda_d
+        self.activation = activation
+        self.learning_rate = learning_rate
+        self.save_folder = save_folder
+        self.iteration = 0
+        self.layers = layers
+
+        """LRP-related by Yang"""
+        self.clust_num = clust_num;
+        self.beta = beta;
+        self.feat_dim = feat_dim;
+        self.curr_temp = 0;
+
+        if restore_folder:
+            self._restore(restore_folder)
+            return
+
+        self.x = tf.placeholder(tf.float32, shape=[None, input_dim], name='x')
+        self.y = tf.placeholder(tf.float32, shape=[None, input_dim], name='y')
+        self.batches = tf.placeholder(tf.int32, shape=[None], name='batches')
+        self.is_training = tf.placeholder(tf.bool, shape=[], name='is_training')
+        self.learning_rate_tensor = tf.placeholder(tf.float32, shape=[], name='learning_rate_tensor')
+        self.temp = tf.placeholder_with_default(0.001, shape=[], name='temp_placeholder');
+        self.concrete_selector = ConcreteSelect(self.feat_dim);
+
+        self._build();
+        self.init_session(limit_gpu_fraction, no_gpu);
+        self.graph_init(self.sess);
+
+
+
+    def init_session(self, limit_gpu_fraction=.1, no_gpu=False):
+        """
+        Initialize a tensorflow session for SAUCIE.
+
+        :param limit_gpu_fraction: float percentage of the avaiable gpu to use
+        :param no_gpu: bool for whether or not to use the gpu if available
+        """
+        if no_gpu:
+            os.environ['CUDA_VISIBLE_DEVICES'] = ''
+            config = tf.ConfigProto(device_count={'GPU': 0})
+            self.sess = tf.Session(config=config)
+        elif limit_gpu_fraction:
+            gpu_options = tf.GPUOptions(per_process_gpu_memory_fraction=limit_gpu_fraction)
+            config = tf.ConfigProto(gpu_options=gpu_options)
+            self.sess = tf.Session(config=config)
+        else:
+            self.sess = tf.Session()
+
+    def graph_init(self, sess=None):
+        """
+        Initialize the tensorflow graph that's been created.
+
+        :param sess: the session to use while initializing, if different from SAUCIE's sess member
+        """
+        if not sess: sess = self.sess
+        self.saver = tf.train.Saver(tf.global_variables(), max_to_keep=1)
+        sess.run(tf.global_variables_initializer())
+
+    def save(self, iteration=None, saver=None, sess=None, folder=None):
+        """
+        Save the current state of SAUCIE.
+
+        :param iteration: the number of training steps SAUCIE has taken, which distinguishes the saved states
+                          throughout training
+        :param saver: the saver instance to use
+        :param sess: the session to save
+        :param folder: the location to save SAUCIE's state to
+        """
+        if not saver: saver = self.saver
+        if not sess: sess = self.sess
+        if not folder: folder = self.save_folder
+
+        savefile = os.path.join(folder, 'SAUCIE')
+        saver.save(sess, savefile, write_meta_graph=True)
+        print("Model saved to {}".format(savefile))
+
+    def _restore(self, restore_folder):
+        """
+        Restore the tensorflow graph stored in restore_folder.
+
+        :param restore_folder: the location of the directory where the saved SAUCIE model resides.
+        """
+        tf.reset_default_graph()
+        self.init_session()
+        ckpt = tf.train.get_checkpoint_state(restore_folder)
+        self.saver = tf.train.import_meta_graph('{}.meta'.format(ckpt.model_checkpoint_path))
+        self.saver.restore(self.sess, ckpt.model_checkpoint_path)
+        print("Model restored from {}".format(restore_folder))
+
+    def _build(self):
+        """Coordinate the building of each part of SAUCIE."""
+        self._build_layers()
+
+        self._build_losses()
+
+        self._build_optimization()
+
+    def _build_layers(self):
+        """Construct the layers of SAUCIE."""
+        if self.lambda_b:
+            if self.feat_dim > 0:
+                self.selected_x = self.concrete_selector(self.x, self.temp, tf.constant(True));
+                self.selected_x = nameop(self.selected_x, 'selector_x');
+                self.h1 = tf.layers.dense(self.selected_x, self.layers[0], activation=tf.nn.relu, name='encoder0', use_bias=True);
+            else:
+                self.h1 = tf.layers.dense(self.x, self.layers[0], activation=tf.nn.relu, name='encoder0', use_bias=True);
+            self.h1 = nameop(self.h1, 'encoder0s')
+
+            self.h2 = tf.layers.dense(self.h1, self.layers[1], activation=tf.nn.relu, name='encoder1', use_bias=True)
+            self.h2 = nameop(self.h2, 'encoder1s')
+
+            self.h3 = tf.layers.dense(self.h2, self.layers[2], activation=tf.nn.relu, name='encoder2', use_bias=True)
+            self.h3 = nameop(self.h3, 'encoder2s')
+
+            self.embedded = tf.layers.dense(self.h3, 2, activation=tf.identity, name='embedding', use_bias=True)
+            self.embedded = nameop(self.embedded, 'embeddings')
+
+            h5 = tf.layers.dense(self.embedded, self.layers[2], activation=tf.nn.relu, name='decoder0', use_bias=True)
+
+            h6 = tf.layers.dense(h5, self.layers[1], activation=tf.nn.relu, name='decoder1', use_bias=True)
+
+            h7 = tf.layers.dense(h6, self.layers[0], activation=tf.nn.relu, name='decoder2', use_bias=True)
+            h7 = nameop(h7, 'layer_c')
+
+            self.reconstructed = tf.layers.dense(h7, self.input_dim, activation=tf.identity, name='recon', use_bias=True)
+            self.reconstructed = nameop(self.reconstructed, 'output')
+
+        elif self.lambda_c:
+            if self.feat_dim > 0:
+                self.selected_x = self.concrete_selector(self.x, self.temp, tf.constant(True));
+                self.selected_x = nameop(self.selected_x, 'selector_x');
+                self.h1 = tf.layers.dense(self.selected_x, self.layers[0], activation=tf.nn.relu, name='encoder0', use_bias=True);
+            else:
+                self.h1 = tf.layers.dense(self.x, self.layers[0], activation=tf.nn.relu, name='encoder0', use_bias=True)
+            self.h1 = nameop(self.h1, 'encoder0s')
+
+            self.h2 = tf.layers.dense(self.h1, self.layers[1], activation=tf.nn.relu, name='encoder1', use_bias=True)
+            self.h2 = nameop(self.h2, 'encoder1s')
+
+            self.h3 = tf.layers.dense(self.h2, self.layers[2], activation=tf.nn.relu, name='encoder2', use_bias=True)
+            self.h3 = nameop(self.h3, 'encoder2s')
+
+            self.embedded = tf.layers.dense(self.h3, self.layers[3], activation=tf.identity, name='embedding', use_bias=True)
+            self.embedded = nameop(self.embedded, 'embeddings')
+
+            h5 = tf.layers.dense(self.embedded, self.layers[2], activation=tf.nn.relu, name='decoder0', use_bias=True)
+
+            h6 = tf.layers.dense(h5, self.layers[1], activation=tf.nn.relu, name='decoder1', use_bias=True)
+
+            h7 = tf.layers.dense(h6, self.layers[0], activation=tf.nn.relu, name='decoder2', use_bias=True)
+            h7 = nameop(h7, 'layer_c')
+
+            self.reconstructed = tf.layers.dense(h7, self.input_dim, activation=tf.identity, name='recon', use_bias=True)
+            self.reconstructed = nameop(self.reconstructed, 'output')
+        else:
+            if self.feat_dim > 0:
+                self.selected_x = self.concrete_selector(self.x, self.temp, tf.constant(True));
+                self.selected_x = nameop(self.selected_x, 'selector_x');
+                self.h1 = tf.layers.dense(self.selected_x, self.layers[0], activation=tf.nn.relu, name='encoder0');
+            else:
+                self.h1 = tf.layers.dense(self.x, self.layers[0], activation=tf.nn.relu, name='encoder0')
+            self.h1 = nameop(self.h1, 'encoder0s')
+
+            self.h2 = tf.layers.dense(self.h1, self.layers[1], activation=tf.nn.relu, name='encoder1')
+            self.h2 = nameop(self.h2, 'encoder1s')
+
+            self.h3 = tf.layers.dense(self.h2, self.layers[2], activation=tf.nn.relu, name='encoder2')
+            self.h3 = nameop(self.h3, 'encoder2s')
+
+            self.embedded = tf.layers.dense(self.h3, self.layers[3], activation=tf.identity, name='embedding')
+            self.embedded = nameop(self.embedded, 'embeddings')
+
+            h5 = tf.layers.dense(self.embedded, self.layers[2], activation=tf.nn.relu, name='decoder0')
+
+            h6 = tf.layers.dense(h5, self.layers[1], activation=tf.nn.relu, name='decoder1')
+
+            h7 = tf.layers.dense(h6, self.layers[0], activation=tf.nn.relu, name='decoder2')
+            h7 = nameop(h7, 'layer_c')
+
+            self.reconstructed = tf.layers.dense(h7, self.input_dim, activation=tf.identity, name='recon')
+            self.reconstructed = nameop(self.reconstructed, 'output')
+
+
+        """LRP-related by Yang"""
+        tf.add_to_collection('LRP', self.x);
+        activation_names = ['encoder0s', 'encoder1s', 'encoder2s', 'embeddings'];
+        for name in activation_names:
+            tf.add_to_collection('LRP', tbn("{}:0".format(name)));
+
+        """clustering: one vs. rest"""
+        clust_pool_layer = ClustMinPoolLayer(self.beta);
+        for clust_id in range(1, self.clust_num+1):
+            print('Add clustering layer...clust_id={}'.format(clust_id))
+            clust_h = tf.layers.dense(self.embedded, self.clust_num - 1,
+                                      activation=None, use_bias=True,
+                                      kernel_initializer=tf.constant_initializer(0.0),
+                                      trainable=False, name='clust{}_linear'.format(clust_id));
+
+            clust_h_name = 'clust{}_linears'.format(clust_id);
+            clust_h = nameop(clust_h, clust_h_name);
+            tf.add_to_collection('LRPClust', tbn("{}:0".format(clust_h_name)));
+
+            clust_fc = clust_pool_layer(clust_h);
+            clust_fc_name = 'clust{}_minpools'.format(clust_id);
+            clust_fc = nameop(clust_fc, clust_fc_name);
+
+            tf.add_to_collection('LRPClust', tbn("{}:0".format(clust_fc_name)));
+
+
+    def _build_losses(self):
+        """Build all the loss ops for the network."""
+        self.loss_recon = 0.
+
+        if self.lambda_b:
+            with tf.variable_scope('reconstruction_mmd'):
+                self._build_reconstruction_loss_mmd(self.reconstructed, self.x)
+            with tf.variable_scope('batchcorrection'):
+                self._build_reg_b()
+
+        else:
+            with tf.variable_scope('reconstruction'):
+                self._build_reconstruction_loss(self.reconstructed, self.x)
+
+        if self.lambda_c:
+            with tf.variable_scope('clustering'):
+                self.loss_c = 0
+
+                act = tbn('layer_c:0')
+                act = act / tf.reduce_max(act)
+                self._build_reg_c(act)
+
+        if self.lambda_d:
+            with tf.variable_scope('intracluster_distances'):
+                self._build_reg_d(act)
+
+        self._build_total_loss()
+
+    def _build_optimization(self, norm_clip=5.):
+        """Build all the optimization ops for the network."""
+        opt = tf.train.AdamOptimizer(self.learning_rate)
+        self.train_op = opt.minimize(self.loss, name='train_op')
+
+    def _build_reconstruction_loss(self, reconstructed, y):
+        """
+        Build the reconstruction loss part of the network if batch correction isn't being performed.
+
+        :param reconstructed: the tensorflow op that was output by the decoder
+        :param y: the tensorflow op for the target
+        """
+        self.loss_recon = tf.reduce_mean((self.reconstructed - y)**2)
+
+        self.loss_recon = nameop(self.loss_recon, 'loss_recon')
+        tf.add_to_collection('losses', self.loss_recon)
+
+    def _build_reconstruction_loss_mmd(self, reconstructed, y):
+        """
+        Build the reconstruction loss part of the network if batch correction is being performed.
+
+        :param reconstructed: the tensorflow op that was output by the decoder
+        :param y: the tensorflow op for the target
+        """
+        refrecon = tf.boolean_mask(reconstructed, tf.equal(self.batches, 0))
+        refy = tf.boolean_mask(y, tf.equal(self.batches, 0))
+        l = (refy - refrecon)**2
+        self.loss_recon += tf.reduce_mean(l)
+
+
+        nonrefrecon = tf.boolean_mask(reconstructed, tf.equal(self.batches, 1))
+        nonrefy = tf.boolean_mask(y, tf.equal(self.batches, 1))
+
+        mean1, var1 = tf.nn.moments(nonrefrecon, 0)
+        mean2, var2 = tf.nn.moments(nonrefy, 0)
+        l = ( ((nonrefrecon - mean1) / (tf.sqrt(var1+1e-6)+1e-6)) - ((nonrefy - mean2) / (tf.sqrt(var2+1e-6)+1e-6)) )**2
+
+        self.loss_recon += .01*tf.reduce_mean(l)
+
+        self.loss_recon = nameop(self.loss_recon, 'loss_recon')
+        tf.add_to_collection('losses', self.loss_recon)
+
+    def _build_reg_d(self, act):
+        """
+        Calculate the intracluster distances in the original data given binary-like codes.
+
+        :param act: the codes that will be binarized and used to determine cluster assignment
+        """
+        out = self._pairwise_dists(act, act)
+        same_cluster = self._gaussian_kernel_matrix(out)
+        same_cluster = same_cluster - tf.reduce_min(same_cluster)
+        same_cluster = same_cluster / tf.reduce_max(same_cluster)
+
+        dists = self._pairwise_dists(self.x, self.x)
+        dists = tf.sqrt(dists + 1e-3)
+
+        intracluster_distances = dists * same_cluster
+        intracluster_distances = tf.reduce_mean(intracluster_distances)
+
+        self.loss_d = self.lambda_d * intracluster_distances
+        self.loss_d = nameop(self.loss_d, 'loss_d')
+        tf.add_to_collection('losses', self.loss_d)
+
+    def _build_reg_c(self, act):
+        """Build the tensorflow graph for the ID regularization."""
+        # sum down neurons
+        p = tf.reduce_sum(act, axis=0, keep_dims=True)
+        # normalize neuron sums
+        normalized = p / tf.reduce_sum(p)
+
+        self.loss_c += self.lambda_c * tf.reduce_sum(-normalized * tf.log(normalized + 1e-9))
+
+        self.loss_c = nameop(self.loss_c, 'loss_c')
+        tf.add_to_collection('losses', self.loss_c)
+
+    def _build_reg_b(self):
+        """Build the tensorflow graph for the MMD regularization."""
+        var_within = {}
+        batch_sizes = {}
+        self.loss_b = tf.constant(0.)
+        if not self.lambda_b:
+            return
+
+        e = self.embedded / tf.reduce_mean(self.embedded)
+        K = self._pairwise_dists(e, e)
+        K = K / tf.reduce_max(K)
+        K = self._gaussian_kernel_matrix(K)
+
+        # reference batch
+        i = 0
+        batch1_rows = tf.boolean_mask(K, tf.equal(self.batches, i))
+        batch1_rowscols = tf.boolean_mask(tf.transpose(batch1_rows), tf.equal(self.batches, i))
+
+        K_b1 = batch1_rowscols
+        n_rows_b1 = tf.cast(tf.reduce_sum(tf.boolean_mask(tf.ones_like(self.batches), tf.equal(self.batches, i))), tf.float32)
+        K_b1 = tf.reduce_sum(K_b1) / (n_rows_b1**2)
+
+        var_within[i] = K_b1
+        batch_sizes[i] = n_rows_b1
+
+        # nonreference batches
+        j = 1
+        batch2_rows = tf.boolean_mask(K, tf.equal(self.batches, j))
+        batch2_rowscols = tf.boolean_mask(tf.transpose(batch2_rows), tf.equal(self.batches, j))
+
+        K_b2 = batch2_rowscols
+        n_rows_b2 = tf.cast(tf.reduce_sum(tf.boolean_mask(tf.ones_like(self.batches), tf.equal(self.batches, j))), tf.float32)
+        K_b2 = tf.reduce_sum(K_b2) / (n_rows_b2**2)
+
+        var_within[j] = K_b2
+        batch_sizes[j] = n_rows_b2
+
+        K_12 = tf.boolean_mask(K, tf.equal(self.batches, i))
+        K_12 = tf.boolean_mask(tf.transpose(K_12), tf.equal(self.batches, j))
+        K_12_ = tf.reduce_sum(tf.transpose(K_12))
+
+        mmd_pair = var_within[i] + var_within[j] - 2 * K_12_ / (batch_sizes[i] * batch_sizes[j])
+        self.loss_b += tf.abs(mmd_pair)
+
+        self.loss_b = self.lambda_b * (self.loss_b)
+        self.loss_b = nameop(self.loss_b, 'loss_b')
+        tf.add_to_collection('losses', self.loss_b)
+
+    def _build_total_loss(self):
+        """Collect all of the losses together."""
+        self.loss = 0
+        for l in tf.get_collection('losses'):
+            self.loss += l
+        self.loss = nameop(self.loss, 'loss')
+
+    def _gaussian_kernel_matrix(self, dist):
+        """Multi-scale RBF kernel."""
+        sigmas = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1, 5, 10, 15, 20, 25, 30, 35, 100, 1e3, 1e4, 1e5, 1e6]
+
+        beta = 1. / (2. * (tf.expand_dims(sigmas, 1)))
+
+        s = tf.matmul(beta, tf.reshape(dist, (1, -1)))
+
+        return tf.reshape(tf.reduce_sum(tf.exp(-s), 0), tf.shape(dist)) / len(sigmas)
+
+    def _pairwise_dists(self, x1, x2):
+        """Helper function to calculate pairwise distances between tensors x1 and x2."""
+        r1 = tf.reduce_sum(x1 * x1, 1, keep_dims=True)
+        r2 = tf.reduce_sum(x2 * x2, 1, keep_dims=True)
+
+        D = r1 - 2 * tf.matmul(x1, tf.transpose(x2)) + tf.transpose(r2)
+
+        return D
+
+    def get_loss_names(self):
+        """Return the strings of the loss names in the order they're printed during training."""
+        losses = [tns.name[:-2].replace('loss_', '').split('/')[-1] for tns in tf.get_collection('losses')]
+        return "Losses: {}".format(' '.join(losses))
+
+    def train(self, load, steps, batch_size=256):
+        """
+        Train SAUCIE.
+
+        :param load: the loader object to yield batches from
+        :param steps: the number of steps to train for
+        :param batch_size: the number of points to train on in each step
+        """
+
+        """LRP-related by Yang"""
+        my_start_temp = 0.5;
+        my_min_temp = 0.001;
+        alpha = np.exp(np.log(my_min_temp / my_start_temp) / steps);
+        self.curr_temp = my_start_temp;
+
+        start = self.iteration
+        while (self.iteration - start) < steps:
+            self.iteration += 1
+
+            batch = load.next_batch(batch_size=batch_size)
+
+            feed = {tbn('x:0'): batch[0],
+                    tbn('y:0'): batch[0],
+                    tbn('is_training:0'): True,
+                    tbn('learning_rate_tensor:0'): self.learning_rate,
+                    tbn('temp_placeholder:0'): self.curr_temp, }
+
+            if len(batch) == 2:
+                feed[tbn('batches:0')] = batch[1]
+
+            # if using batch-correction, must have labels
+            if (self.lambda_b and len(batch) < 2):
+                raise Exception("If using lambda_b (batch correction), you must provide each point's batch as a label")
+
+            ops = [obn('train_op')]
+
+            self.sess.run(ops, feed_dict=feed)
+
+            self.curr_temp = max(my_min_temp, self.curr_temp * alpha);
+            # print('iter={}\tcurr_temp={}'.format(self.iteration, self.curr_temp));
+
+
+    def get_loss(self, load, batch_size=256):
+        """
+        Get the current losses over the dataset.
+
+        :param load: the loader object to iterate over
+        """
+        losses = None
+
+        for i, batch in enumerate(load.iter_batches(batch_size=batch_size)):
+
+            feed = {tbn('x:0'): batch[0],
+                    tbn('y:0'): batch[0],
+                    tbn('is_training:0'): False, }
+            if len(batch) == 2:
+                feed[tbn('batches:0')] = batch[1]
+
+            batch_losses = self.sess.run(tf.get_collection('losses'), feed_dict=feed)
+
+            if not losses:
+                losses = batch_losses
+            else:
+                losses = [loss + batch_loss for loss, batch_loss in zip(losses, batch_losses)]
+
+        losses = [loss / float(i + 1) for loss in losses]
+        lstring = ' '.join(['{:.3f}'.format(loss) for loss in losses])
+
+        return lstring
+
+    def get_layer(self, load, name):
+        """
+        Get the actual values in array_like form from an abstract tensor.
+
+        :param load: the loader object to iterate over
+        :param name: the name of the tensor to evaluate for each point
+        """
+        tensor_name = "{}:0".format(name)
+        tensor = tbn(tensor_name)
+        layer = []
+        labels = []
+        for batch in load.iter_batches():
+
+            feed = {tbn('x:0'): batch[0],
+                    tbn('y:0'): batch[0],
+                    tbn('is_training:0'): False, }
+            if len(batch) == 2:
+                feed[tbn('batches:0')] = batch[1]
+                labels.append(batch[1])
+
+            [act] = self.sess.run([tensor], feed_dict=feed)
+            layer.append(act)
+
+        layer = np.concatenate(layer, axis=0)
+
+        if labels:
+            labels = np.concatenate(labels, axis=0)
+            return layer, labels
+        else:
+            return layer
+
+
+    def get_embedding(self, load):
+        """Return the embedding layer."""
+        embedding = self.get_layer(load, 'embeddings')
+        return embedding
+
+    def get_reconstruction(self, load):
+        """Return the reconstruction layer."""
+        reconstruction = self.get_layer(load, 'output')
+        return reconstruction
+
+    def get_selected_feat(self):
+        if self.feat_dim > 0:
+            probabilities = tf.nn.softmax(self.concrete_selector.logits / self.curr_temp);
+            selected_prob = self.sess.run(probabilities);
+            selected_feat = np.argmax(selected_prob, axis=1);
+            print('selected_prob={}\tselected_feat={}'.format( selected_prob.shape, selected_feat.shape));
+            return np.unique(selected_feat);
+        return np.asarray([]);
+
+    """LRP-related by Yang"""
+    def get_embed_dim(self):
+        return self.layers[-1];
+
+    """LRP-related by Yang"""
+    def get_layer_weights_biases(self, name):
+        weights = tbn("{}/kernel:0".format(name));
+        biases = tbn("{}/bias:0".format(name));
+        return weights.eval(session=self.sess), biases.eval(session=self.sess);
+
+    """LRP-related by Yang"""
+    def get_embedder_tensors(self):
+        embed_weights = [x for x in tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='.*kernel.*') if 'encoder' in x.name or 'embedding' in x.name];
+        embed_biases = [x for x in tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, scope='.*bias.*') if 'encoder' in x.name or 'embedding' in x.name];
+        embed_activations = tf.get_collection('LRP');
+        # embed_weights.reverse(); embed_biases.reverse(); embed_activations.reverse();
+        print('embed_weights={}\n\n embed_biases={}\n\n embed_activations={}\n\n'.format(embed_weights, embed_biases, embed_activations));
+        return embed_weights, embed_biases, embed_activations;
+
+    """LRP-related by Yang"""
+    def get_clust_tensors(self):
+        clust_weights = [x for x in tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='.*kernel.*') if 'clust' in x.name];
+        clust_biases = [x for x in tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES, scope='.*bias.*') if 'clust' in x.name];
+        clust_activations = tf.get_collection('LRPClust');
+        print('clust_weights={}\n\n clust_biases={}\n\n clust_activations={}\n\n'.format(clust_weights, clust_biases, clust_activations));
+        return clust_weights, clust_biases, clust_activations;
+
+    """LRP-related by Yang"""
+    def set_clust_tensors(self, clust_weight_tensor, clust_bias_tensor, new_weights, new_biases, debug_mode=True):
+        if debug_mode:
+            old_tensor_weights, old_tensor_biases = self.sess.run([clust_weight_tensor, clust_bias_tensor]);
+            print('old_tensor_weights={}\told_tensor_biases={}'.format(old_tensor_weights, old_tensor_biases));
+            print('new_weights={}\tnew_biases={}'.format(new_weights, new_biases));
+
+        assign_weights = tf.assign(clust_weight_tensor, new_weights);
+        assign_biases = tf.assign(clust_bias_tensor, new_biases);
+        self.sess.run([assign_weights, assign_biases]);
+
+        if debug_mode:
+            new_tensor_weights, new_tensor_biases = self.sess.run([clust_weight_tensor, clust_bias_tensor]);
+            print('new_tensor_weights={}\tnew_tensor_biases={}'.format(new_tensor_weights, new_tensor_biases));
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
