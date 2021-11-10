@@ -584,7 +584,7 @@ if __name__ == "__main__":
     parser.add_argument('--margin', type=float, help='margin', default=0);
     parser.add_argument('--latent_dim', type=int, help='latent_dim', default=2);
 
-    parser.add_argument('--feat_dim', type=int, help='feat_dim', default=-1);
+    parser.add_argument('--feat_dim', type=int, help='feat_dim', default=128);
     parser.add_argument('--label', type=str, help='label', default='');
     parser.add_argument('--plot_embedding', type=int, help='plot_embedding', default=0);
     parser.add_argument('--overwrite', type=int, help='overwrite', default=0);
